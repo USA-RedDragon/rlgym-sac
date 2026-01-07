@@ -121,10 +121,19 @@ class PPOLearner(object):
         ).cpu()
 
         t1 = time.time()
+        
+        ppo_step_time = 0
+        ppo_data_load_time = 0
+
         for epoch in range(self.n_epochs):
+            t_epoch_start = time.perf_counter()
+            
             # Get all shuffled batches from the experience buffer.
             batches = exp.get_all_batches_shuffled(self.batch_size)
+            
+            epoch_step_time = 0
             for batch in batches:
+                t_step_start = time.perf_counter()
                 (
                     batch_acts,
                     batch_old_probs,
@@ -198,6 +207,12 @@ class PPOLearner(object):
                 self.value_optimizer.step()
 
                 n_iterations += 1
+                epoch_step_time += time.perf_counter() - t_step_start
+            
+            t_epoch_end = time.perf_counter()
+            ppo_step_time += epoch_step_time
+            ppo_data_load_time += (t_epoch_end - t_epoch_start) - epoch_step_time
+
 
         if n_iterations == 0:
             n_iterations = 1
@@ -229,6 +244,8 @@ class PPOLearner(object):
 
         report = {
             "PPO Batch Consumption Time": (time.time() - t1) / n_iterations,
+            "PPO Data Loading Time": ppo_data_load_time,
+            "PPO Step Time": ppo_step_time,
             "Cumulative Model Updates": self.cumulative_model_updates,
             "Policy Entropy": mean_entropy,
             "Mean KL Divergence": mean_divergence,
