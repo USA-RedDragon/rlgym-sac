@@ -124,7 +124,7 @@ class Learner(object):
         self.use_amp = use_amp
 
         self.experience_buffer = ExperienceBuffer(
-            self.exp_buffer_size, seed=random_seed, device="cpu"
+            self.exp_buffer_size, seed=random_seed, device=self.device
         )
 
         print("Initializing processes...")
