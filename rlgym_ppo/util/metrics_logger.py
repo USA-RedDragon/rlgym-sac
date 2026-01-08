@@ -8,8 +8,8 @@ except ImportError:
     GameState = object
 
 class MetricsLogger(ABC):
-    def collect_metrics(self, game_state: GameState) -> np.ndarray:
-        metrics_arrays = self._collect_metrics(game_state)
+    def collect_metrics(self, game_state: GameState, done: bool) -> np.ndarray:
+        metrics_arrays = self._collect_metrics(game_state, done)
         unraveled = []
         for arr in metrics_arrays:
             shape = np.shape(arr)
@@ -43,7 +43,7 @@ class MetricsLogger(ABC):
 
         self._report_metrics(all_reports, wandb_run, cumulative_timesteps)
 
-    def _collect_metrics(self, game_state: GameState) -> np.ndarray:
+    def _collect_metrics(self, game_state: GameState, done: bool) -> np.ndarray:
         raise NotImplementedError
 
     def _report_metrics(self, collected_metrics, wandb_run, cumulative_timesteps):

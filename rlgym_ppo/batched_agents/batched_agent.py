@@ -153,7 +153,7 @@ def batched_agent_process(proc_id, endpoint, shm_buffer, shm_offset, shm_size, s
                 truncated = 1.0 if truncated else 0.0
 
                 if metrics_encoding_function is not None:
-                    metrics = metrics_encoding_function(info["state"])
+                    metrics = metrics_encoding_function(info["state"], done == 1.0 or truncated == 1.0)
                     metrics_shape = [float(arg) for arg in metrics.shape]
                 else:
                     metrics = np.empty(shape=(0,))
