@@ -247,9 +247,13 @@ class Learner(object):
         :return: None
         """
 
-        # Class to watch for keyboard hits
-        kb = KBHit()
-        print("Press (p) to pause (c) to checkpoint, (q) to checkpoint and quit (after next iteration)\n")
+        # Class to watch for keyboard hits; may fail when no TTY (e.g., spawned sweep)
+        try:
+            kb = KBHit()
+            print("Press (p) to pause (c) to checkpoint, (q) to checkpoint and quit (after next iteration)\n")
+        except Exception as e:
+            kb = None
+            print(f"KBHit disabled (no TTY): {e}")
 
         # While the number of timesteps we have collected so far is less than the
         # amount we are allowed to collect.
@@ -311,7 +315,7 @@ class Learner(object):
             # c: checkpoint
             # q: checkpoint and quit
 
-            if kb.kbhit():
+            if kb is not None and kb.kbhit():
                 c = kb.getch()
                 if c == 'p':  # pause
                     print("Paused, press any key to resume")
