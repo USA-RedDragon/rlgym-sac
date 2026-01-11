@@ -268,22 +268,15 @@ class Learner(object):
             # Add the new experience to our buffer and compute the various
             # reinforcement learning quantities we need to
             # learn from (advantages, values, returns).
-            add_exp_time_start = time.perf_counter()
-            add_exp_report = self.add_new_experience(experience)
-            add_exp_time_end = time.perf_counter()
+            self.add_new_experience(experience)
 
             # Let PPO compute updates using our experience buffer.
-            ppo_learn_start = time.perf_counter()
             ppo_report = self.ppo_learner.learn(self.experience_buffer)
-            ppo_learn_end = time.perf_counter()
             epoch_stop = time.perf_counter()
             epoch_time = epoch_stop - epoch_start
 
             # Report variables we care about.
             report.update(ppo_report)
-            report.update(add_exp_report)
-            report["Add New Experience Time"] = add_exp_time_end - add_exp_time_start
-            report["PPO Learn Time"] = ppo_learn_end - ppo_learn_start
 
             if self.epoch < 1:
                 report["Value Function Loss"] = np.nan
@@ -360,13 +353,9 @@ class Learner(object):
         val_inp[:-1] = states
         val_inp[-1] = next_states[-1]
 
-        # Predict the expected returns at each state.
-        t0 = time.perf_counter()
-        
         # Keep val_preds as tensor on GPU to avoid CPU sync
         val_preds = value_net(val_inp).flatten()
         # torch.cuda.empty_cache() # Unnecessary sync point + overhead
-        t1 = time.perf_counter()
 
         # Compute the desired reinforcement learning quantities.
         ret_std = self.return_stats.std[0] if self.standardize_returns else None
@@ -380,7 +369,6 @@ class Learner(object):
             lmbda=self.gae_lambda,
             return_std=ret_std,  # 1 by default if no standardization is requested
         )
-        t2 = time.perf_counter()
 
         if self.standardize_returns:
             # Update the running statistics about the returns.
@@ -400,13 +388,6 @@ class Learner(object):
             value_targets,
             advantages,
         )
-        t3 = time.perf_counter()
-
-        return {
-            "Value Prediction Time": t1 - t0,
-            "GAE Computation Time": t2 - t1,
-            "Experience Submission Time": t3 - t2
-        }
 
     def save(self, cumulative_timesteps):
         """

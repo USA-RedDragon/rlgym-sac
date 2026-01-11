@@ -249,8 +249,6 @@ class PPOLearner(object):
 
         report = {
             "PPO Batch Consumption Time": (time.time() - t1) / n_iterations,
-            "PPO Data Loading Time": ppo_data_load_time,
-            "PPO Step Time": ppo_step_time,
             "Cumulative Model Updates": self.cumulative_model_updates,
             "Policy Entropy": mean_entropy,
             "Mean KL Divergence": mean_divergence,
