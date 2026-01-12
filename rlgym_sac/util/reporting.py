@@ -29,7 +29,6 @@ def _form_printable_groups(report):
 
     groups = [
         {"Policy Reward": safe_get("Policy Reward"),
-         # SAC/PPO common
          "Value Function Loss": safe_get("Value Function Loss"),
          "Policy Loss": safe_get("Policy Loss"),
          "Alpha": safe_get("Alpha"),
