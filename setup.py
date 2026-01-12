@@ -23,16 +23,16 @@ setup(
     url='https://github.com/USA-RedDragon/rlgym-sac',
 
     install_requires=[
-        'gym>0.23',
-        'numpy>1.21',
+        'gymnasium>=1.2.3',
+        'numpy>=1.21',
         'rlviser-py>=0.6.13',
         'rocketsim>=2.1.1.post4',
-        'torch>1.13',
-        'wandb>0.15',
+        'torch>=1.13',
+        'wandb>=0.15',
     ],
     python_requires='>=3.7',
     cmdclass={'install': CustomInstall},
     license='Apache 2.0',
     license_file='LICENSE',
-    keywords=['rocket-league', 'gym', 'reinforcement-learning', 'simulation', 'sac', 'rlgym', 'rocketsim']
+    keywords=['rocket-league', 'gymnasium', 'reinforcement-learning', 'simulation', 'sac', 'rlgym', 'rocketsim']
 )
