@@ -4,6 +4,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import torch.optim as optim
+from torch.amp import GradScaler, autocast
 import gymnasium as gym
 
 # CleanRL imports
@@ -45,7 +46,8 @@ class SACLearner:
                  tau=0.005,
                  gamma=0.99,
                  policy_layer_sizes=(256, 256),
-                 critic_layer_sizes=(256, 256)):
+                 critic_layer_sizes=(256, 256),
+                 use_amp=True):
         
         self.device = torch.device(device if device != "auto" else ("cuda" if torch.cuda.is_available() else "cpu"))
         self.batch_size = batch_size
@@ -55,6 +57,15 @@ class SACLearner:
         self.learning_rate = learning_rate
         self.train_freq = train_freq
         self.gradient_steps = gradient_steps
+        self.use_amp = use_amp and self.device.type == "cuda"
+        self.autocast_device = "cuda"
+        # Gracefully handle older torch versions that lack device_type on GradScaler
+        try:
+            self.scaler = GradScaler(device_type=self.autocast_device, enabled=self.use_amp)
+            self._use_device_type_ctx = True
+        except TypeError:
+            self.scaler = GradScaler(enabled=self.use_amp)
+            self._use_device_type_ctx = False
         
         # Define spaces for CleanRL classes
         # cleanrl buffers expects gymnasium spaces
@@ -107,6 +118,12 @@ class SACLearner:
         
         self.cumulative_model_updates = 0
         self.policy = PolicyWrapper(self.actor, self.device)
+
+    def _autocast_context(self):
+        try:
+            return autocast(device_type=self.autocast_device, enabled=self.use_amp)
+        except TypeError:
+            return autocast(enabled=self.use_amp)
 
     def add_experience(self, experience):
         states, actions, log_probs, rewards, next_states, dones, truncated = experience
@@ -173,23 +190,28 @@ class SACLearner:
             data = self.replay_buffer.sample(self.batch_size)
             
             # --- Update Q functions ---
-            with torch.no_grad():
-                next_state_actions, next_state_log_pi, _ = self.actor.get_action(data.next_observations)
-                qf1_next_target = self.qf1_target(data.next_observations, next_state_actions)
-                qf2_next_target = self.qf2_target(data.next_observations, next_state_actions)
-                
-                min_qf_next_target = torch.min(qf1_next_target, qf2_next_target) - self.alpha * next_state_log_pi
-                next_q_value = data.rewards.flatten() + (1 - data.dones.flatten()) * self.gamma * (min_qf_next_target).view(-1)
+            with self._autocast_context():
+                with torch.no_grad():
+                    next_state_actions, next_state_log_pi, _ = self.actor.get_action(data.next_observations)
+                    qf1_next_target = self.qf1_target(data.next_observations, next_state_actions)
+                    qf2_next_target = self.qf2_target(data.next_observations, next_state_actions)
+                    
+                    min_qf_next_target = torch.min(qf1_next_target, qf2_next_target) - self.alpha * next_state_log_pi
+                    next_q_value = data.rewards.flatten() + (1 - data.dones.flatten()) * self.gamma * (min_qf_next_target).view(-1)
 
-            qf1_a_values = self.qf1(data.observations, data.actions).view(-1)
-            qf2_a_values = self.qf2(data.observations, data.actions).view(-1)
-            qf1_loss = F.mse_loss(qf1_a_values, next_q_value)
-            qf2_loss = F.mse_loss(qf2_a_values, next_q_value)
-            qf_loss = qf1_loss + qf2_loss
+                qf1_a_values = self.qf1(data.observations, data.actions).view(-1)
+                qf2_a_values = self.qf2(data.observations, data.actions).view(-1)
+                qf1_loss = F.mse_loss(qf1_a_values, next_q_value)
+                qf2_loss = F.mse_loss(qf2_a_values, next_q_value)
+                qf_loss = qf1_loss + qf2_loss
 
             self.q_optimizer.zero_grad()
-            qf_loss.backward()
-            self.q_optimizer.step()
+            if self.use_amp:
+                self.scaler.scale(qf_loss).backward()
+                self.scaler.step(self.q_optimizer)
+            else:
+                qf_loss.backward()
+                self.q_optimizer.step()
             
             qf_losses.append(qf_loss.item())
             q_vals.append(qf1_a_values.mean().item())
@@ -198,29 +220,42 @@ class SACLearner:
             # TODO: Add policy delay support if needed (CleanRL has it, we can expose it)
             # For now updating every step
             
-            pi, log_pi, _ = self.actor.get_action(data.observations)
-            qf1_pi = self.qf1(data.observations, pi)
-            qf2_pi = self.qf2(data.observations, pi)
-            min_qf_pi = torch.min(qf1_pi, qf2_pi)
-            actor_loss = ((self.alpha * log_pi) - min_qf_pi).mean()
+            with self._autocast_context():
+                pi, log_pi, _ = self.actor.get_action(data.observations)
+                qf1_pi = self.qf1(data.observations, pi)
+                qf2_pi = self.qf2(data.observations, pi)
+                min_qf_pi = torch.min(qf1_pi, qf2_pi)
+                actor_loss = ((self.alpha * log_pi) - min_qf_pi).mean()
 
             self.actor_optimizer.zero_grad()
-            actor_loss.backward()
-            self.actor_optimizer.step()
+            if self.use_amp:
+                self.scaler.scale(actor_loss).backward()
+                self.scaler.step(self.actor_optimizer)
+            else:
+                actor_loss.backward()
+                self.actor_optimizer.step()
             
             actor_losses.append(actor_loss.item())
 
             # --- Update Alpha ---
             if self.autotune:
-                with torch.no_grad():
-                    _, log_pi, _ = self.actor.get_action(data.observations)
-                alpha_loss = (-self.log_alpha.exp() * (log_pi + self.target_entropy)).mean()
+                with self._autocast_context():
+                    with torch.no_grad():
+                        _, log_pi, _ = self.actor.get_action(data.observations)
+                    alpha_loss = (-self.log_alpha.exp() * (log_pi + self.target_entropy)).mean()
 
                 self.a_optimizer.zero_grad()
-                alpha_loss.backward()
-                self.a_optimizer.step()
+                if self.use_amp:
+                    self.scaler.scale(alpha_loss).backward()
+                    self.scaler.step(self.a_optimizer)
+                else:
+                    alpha_loss.backward()
+                    self.a_optimizer.step()
                 self.alpha = self.log_alpha.exp().item()
                 alpha_losses.append(alpha_loss.item())
+
+            if self.use_amp:
+                self.scaler.update()
 
             # --- Update Target Networks ---
             for param, target_param in zip(self.qf1.parameters(), self.qf1_target.parameters()):

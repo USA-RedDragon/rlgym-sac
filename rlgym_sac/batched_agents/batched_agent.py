@@ -107,7 +107,7 @@ def batched_agent_process(proc_id, endpoint, shm_buffer, shm_offset, shm_size, s
                     env.render()
                     continue
 
-            message_bytes = pipe.recv(4096)
+            message_bytes = pipe.recv(65535)
             message = frombuffer(message_bytes, dtype=np.float32)
             # message = byte_headers.unpack_message(message_bytes)
             header = message[:header_len]

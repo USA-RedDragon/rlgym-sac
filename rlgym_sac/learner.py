@@ -39,7 +39,7 @@ class Learner(object):
             exp_buffer_size: int = 1_000_000,
             ts_per_iteration: int = 50000,
             standardize_returns: bool = True,
-            standardize_obs: bool = False,
+            standardize_obs: bool = True,
             max_returns_per_stats_increment: int = 150,
             steps_per_obs_stats_increment: int = 5,
 
@@ -152,6 +152,7 @@ class Learner(object):
             gamma=sac_gamma,
             policy_layer_sizes=policy_layer_sizes,
             critic_layer_sizes=critic_layer_sizes,
+            use_amp=self.use_amp,
         )
 
         self.agent.policy = self.sac_learner.policy
