@@ -18,10 +18,9 @@ def batched_agent_process(proc_id, endpoint, shm_buffer, shm_offset, shm_size, s
     import time
     import select
 
-    import gym
     import numpy as np
 
-    from rlgym_ppo.batched_agents import comm_consts
+    from rlgym_sac.batched_agents import comm_consts
 
     if render:
         try:
@@ -70,6 +69,8 @@ def batched_agent_process(proc_id, endpoint, shm_buffer, shm_offset, shm_size, s
     # Seed everything.
     env.action_space.seed(seed)
     reset_state = env.reset()
+    if isinstance(reset_state, tuple):
+        reset_state = reset_state[0]
 
     if type(reset_state) != np.ndarray:
         reset_state = np.asarray(reset_state, dtype=np.float32)
@@ -136,7 +137,10 @@ def batched_agent_process(proc_id, endpoint, shm_buffer, shm_offset, shm_size, s
                     rew = [float(rew)]
 
                 if done or truncated:
-                    obs = np.asarray(env.reset(), dtype=np.float32)
+                    reset_state = env.reset()
+                    if isinstance(reset_state, tuple):
+                        reset_state = reset_state[0]
+                    obs = np.asarray(reset_state, dtype=np.float32)
                     n_agents = float(obs.shape[0]) if len(obs.shape) > 1 else 1
 
                     state_shape = [float(arg) for arg in obs.shape]
@@ -191,16 +195,6 @@ def batched_agent_process(proc_id, endpoint, shm_buffer, shm_offset, shm_size, s
                         time.sleep(0.1)
 
             elif header[0] == ENV_SHAPES_HEADER[0]:
-                t = type(env.action_space)
-                action_space_type = 0.0  # "discrete"
-                action_type = "Discrete"
-                if t == gym.spaces.multi_discrete.MultiDiscrete:
-                    action_space_type = 1.0  # "multi-discrete"
-                    action_type = "Multi-discrete"
-                elif t == gym.spaces.box.Box:
-                    action_space_type = 2.0  # "continuous"
-                    action_type = "Continuous"
-
                 if hasattr(env.action_space, "n"):
                     n_acts = float(env.action_space.n)
                 else:
@@ -210,14 +204,12 @@ def batched_agent_process(proc_id, endpoint, shm_buffer, shm_offset, shm_size, s
                 print("Received request for env shapes, returning:")
                 print(F"- Observations shape: {env.observation_space.shape}")
                 print(F"- Number of actions: {n_acts}")
-                print(F"- Action space type: {action_space_type} ({action_type})")
                 print("--------------------")
 
                 env_shape = float(np.prod(env.observation_space.shape))
                 message_floats = ENV_SHAPES_HEADER + [
                     env_shape,
                     n_acts,
-                    action_space_type,
                 ]
                 pipe.sendto(comm_consts.pack_message(message_floats), endpoint)
 

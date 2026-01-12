@@ -19,9 +19,9 @@ import numpy as np
 from numpy import frombuffer, prod
 import torch
 
-from rlgym_ppo.batched_agents import BatchedTrajectory, comm_consts
-from rlgym_ppo.batched_agents.batched_agent import batched_agent_process
-from rlgym_ppo.util import WelfordRunningStat
+from rlgym_sac.batched_agents import BatchedTrajectory, comm_consts
+from rlgym_sac.batched_agents.batched_agent import batched_agent_process
+from rlgym_sac.util import WelfordRunningStat
 
 try:
     from tqdm import tqdm
@@ -385,13 +385,13 @@ class BatchedAgentManager(object):
     def _get_env_shapes(self):
         """
         Retrieve environment observation and action space shapes from one of the connected environment processes.
-        :return: A tuple containing observation shape, action shape, and action space type.
+        :return: A tuple containing observation shape and action shape.
         """
-        process, parent_end, child_endpoint, shm_view = self.processes[0]
+        _, parent_end, child_endpoint, _ = self.processes[0]
         request_msg = comm_consts.pack_message(comm_consts.ENV_SHAPES_HEADER)
         parent_end.sendto(request_msg, child_endpoint)
 
-        obs_shape, action_shape, action_space_type = -1, -1, -1
+        obs_shape, action_shape = -1, -1
         done = False
 
         while not done:
@@ -401,10 +401,10 @@ class BatchedAgentManager(object):
             if header == comm_consts.ENV_SHAPES_HEADER:
                 data = message[comm_consts.HEADER_LEN :]
 
-                obs_shape, action_shape, action_space_type = data
+                obs_shape, action_shape = data
                 done = True
 
-        return int(obs_shape), int(action_shape), int(action_space_type)
+        return int(obs_shape), int(action_shape)
 
     def init_processes(
         self,
@@ -425,7 +425,7 @@ class BatchedAgentManager(object):
         :param spawn_delay: Delay between spawning environment instances. Defaults to None.
         :param render: Whether an environment should be rendered while collecting timesteps.
         :param render_delay: A period in seconds to delay a process between frames while rendering.
-        :return: A tuple containing observation shape, action shape, and action space type.
+        :return: A tuple containing observation shape and action shape.
         """
 
         can_fork = "forkserver" in mp.get_all_start_methods()
@@ -499,8 +499,8 @@ class BatchedAgentManager(object):
         """
         import traceback
 
-        for proc_id, proc_package in enumerate(self.processes):
-            process, parent_end, child_endpoint, shm_view = proc_package
+        for _, proc_package in enumerate(self.processes):
+            process, parent_end, child_endpoint, _ = proc_package
 
             try:
                 parent_end.sendto(

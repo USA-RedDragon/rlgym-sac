@@ -13,14 +13,14 @@ class CustomInstall(install):
         install.run(self)
 
 setup(
-    name='rlgym-ppo',
+    name='rlgym-sac',
     packages=find_packages(),
     version=__version__,
-    description='A multi-processed implementation of PPO for use with RLGym.',
+    description='A multi-processed implementation of SAC for use with RLGym.',
     long_description=long_description,
     long_description_content_type='text/markdown',
-    author='Matthew Allen',
-    url='https://github.com/AechPro/rlgym-ppo',
+    author='Jacob McSwain',
+    url='https://github.com/USA-RedDragon/rlgym-sac',
 
     install_requires=[
         'cloudpickle>2.0',
@@ -34,11 +34,11 @@ setup(
         'sympy>1.10',
         'torch>1.13',
         'wandb>0.15',
-        'typing_extensions>4.6'
+        'typing_extensions>4.6',
     ],
     python_requires='>=3.7',
     cmdclass={'install': CustomInstall},
     license='Apache 2.0',
     license_file='LICENSE',
-    keywords=['rocket-league', 'gym', 'reinforcement-learning', 'simulation', 'ppo', 'rlgym', 'rocketsim']
+    keywords=['rocket-league', 'gym', 'reinforcement-learning', 'simulation', 'sac', 'rlgym', 'rocketsim']
 )

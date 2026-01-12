@@ -1,10 +1,10 @@
 import numpy as np
 from rlgym_sim.utils.gamestates import GameState
-from rlgym_ppo.util import MetricsLogger
+from rlgym_sac.util import MetricsLogger
 
 
 class ExampleLogger(MetricsLogger):
-    def _collect_metrics(self, game_state: GameState) -> list:
+    def _collect_metrics(self, game_state: GameState, done: bool) -> list:
         return [game_state.players[0].car_data.linear_velocity,
                 game_state.players[0].car_data.rotation_mtx(),
                 game_state.orange_score]
@@ -67,7 +67,7 @@ def build_rocketsim_env():
     return env
 
 if __name__ == "__main__":
-    from rlgym_ppo import Learner
+    from rlgym_sac import Learner
     metrics_logger = ExampleLogger()
 
     # 32 processes
@@ -80,12 +80,13 @@ if __name__ == "__main__":
                       n_proc=n_proc,
                       min_inference_size=min_inference_size,
                       metrics_logger=metrics_logger,
-                      ppo_batch_size=50000,
+                      render=True,
                       ts_per_iteration=50000,
-                      exp_buffer_size=150000,
-                      ppo_minibatch_size=50000,
-                      ppo_ent_coef=0.001,
-                      ppo_epochs=1,
+                      exp_buffer_size=1_000_000,
+                      sac_batch_size=256,
+                      sac_ent_coef='auto',
+                      sac_learning_rate=3e-4,
+                      sac_learning_starts=10000,
                       standardize_returns=True,
                       standardize_obs=False,
                       save_every_ts=100_000,

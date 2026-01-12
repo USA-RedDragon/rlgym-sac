@@ -1,16 +1,16 @@
-# RLGym-PPO
-A vectorized implementation of PPO for use with [RLGym](rlgym.org).
+# RLGym-SAC
+A vectorized implementation of SAC for use with [RLGym](rlgym.org).
 
 ## INSTALLATION
-1. install [RLGym-sim](https://github.com/AechPro/rocket-league-gym-sim). 
+1. install [RLGym-sim](https://github.com/AechPro/rocket-league-gym-sim).
 2. If you would like to use a GPU install [PyTorch with CUDA](https://pytorch.org/get-started/locally/)
-3. Install this project via `pip install git+https://github.com/AechPro/rlgym-ppo`
+3. Install this project via `pip install git+https://github.com/USA-RedDragon/rlgym-sac`
 
 ## USAGE
-Simply import the learner with `from rlgym_ppo import Learner`, pass it a function that will return an RLGym environment
+Simply import the learner with `from rlgym_sac import Learner`, pass it a function that will return an RLGym environment
 and run the learning algorithm. A simple example follows:
 ```
-from rlgym_ppo import Learner
+from rlgym_sac import Learner
 
 def my_rlgym_function():
     import rlgym_sim

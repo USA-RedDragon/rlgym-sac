@@ -10,7 +10,10 @@ Description:
 import torch
 import numpy as np
 import locale
-locale.setlocale(locale.LC_ALL, '')
+try:
+    locale.setlocale(locale.LC_ALL, '')
+except locale.Error:
+    pass # fallback
 
 
 def _form_printable_groups(report):
@@ -19,30 +22,41 @@ def _form_printable_groups(report):
     :param report: A dictionary containing all of the values to organize.
     :return: A list of dictionaries containing keys organized in the desired fashion.
     """
+    
+    # helper to safely get key
+    def safe_get(key):
+        return report.get(key, "N/A")
 
     groups = [
-        {"Policy Reward": report["Policy Reward"],
-         "Policy Entropy": report["Policy Entropy"],
-         "Value Function Loss": report["Value Function Loss"]},
+        {"Policy Reward": safe_get("Policy Reward"),
+         # SAC/PPO common
+         "Value Function Loss": safe_get("Value Function Loss"),
+         "Policy Loss": safe_get("Policy Loss"),
+         "Alpha": safe_get("Alpha"),
+         "Alpha Loss": safe_get("Alpha Loss"),
+         "Mean Q Value": safe_get("Mean Q Value")},
+        
+        {"Collected Steps per Second": safe_get("Collected Steps per Second"),
+         "Overall Steps per Second": safe_get("Overall Steps per Second")},
 
-        {"Mean KL Divergence": report["Mean KL Divergence"],
-         "SB3 Clip Fraction": report["SB3 Clip Fraction"],
-         "Policy Update Magnitude": report["Policy Update Magnitude"],
-         "Value Function Update Magnitude": report["Value Function Update Magnitude"]},
+        {"Timestep Collection Time": safe_get("Timestep Collection Time"),
+         "Timestep Consumption Time": safe_get("Timestep Consumption Time"),
+         "Total Iteration Time": safe_get("Total Iteration Time")},
 
-        {"Collected Steps per Second": report["Collected Steps per Second"],
-         "Overall Steps per Second": report["Overall Steps per Second"]},
+        {"Cumulative Model Updates": safe_get("Cumulative Model Updates"),
+         "Cumulative Timesteps": safe_get("Cumulative Timesteps")},
 
-        {"Timestep Collection Time": report["Timestep Collection Time"],
-         "Timestep Consumption Time": report["Timestep Consumption Time"],
-         "PPO Batch Consumption Time": report["PPO Batch Consumption Time"],
-         "Total Iteration Time": report["Total Iteration Time"]},
+        {"Timesteps Collected": safe_get("Timesteps Collected")},
+    ]
 
-        {"Cumulative Model Updates": report["Cumulative Model Updates"],
-         "Cumulative Timesteps": report["Cumulative Timesteps"]},
-
-        {"Timesteps Collected": report["Timesteps Collected"]},
-              ]
+    # Add other keys that are in report but not in groups
+    covered_keys = set()
+    for g in groups:
+        covered_keys.update(g.keys())
+    
+    rest = {k: v for k, v in report.items() if k not in covered_keys}
+    if rest:
+        groups.append(rest)
 
     return groups
 
@@ -70,7 +84,10 @@ def report_metrics(loggable_metrics, debug_metrics, wandb_run=None):
     groups = _form_printable_groups(loggable_metrics)
     out = ""
     for group in groups:
-        out += dump_dict_to_debug_string(group) + "\n"
+        # Filter out N/A for clean printing
+        group = {k: v for k, v in group.items() if v != "N/A"}
+        if group:
+            out += dump_dict_to_debug_string(group) + "\n"
     print(out[:-2])
     print("{}{}{}\n\n".format("-"*8, "END ITERATION REPORT", "-"*8))
 
@@ -84,30 +101,36 @@ def dump_dict_to_debug_string(dictionary):
 
     debug_string = ""
     for key, val in dictionary.items():
-        if type(val) == torch.Tensor:
+        if isinstance(val, torch.Tensor):
             if len(val.shape) == 0:
                 val = val.detach().cpu().item()
             else:
                 val = val.detach().cpu().tolist()
 
         # Format lists of numbers as [num_1, num_2, num_3] where num_n is clipped at 5 decimal places.
-        if type(val) in (tuple, list, np.ndarray, np.array):
+        if isinstance(val, (tuple, list, np.ndarray)):
             arr_str = []
             for arg in val:
-                arr_str.append(locale.format_string("%7.5f", arg, grouping=True) if type(arg) == float
-                               else "{},".format(arg))
+                if isinstance(arg, float):
+                    arr_str.append(f"{arg:7.5f}")
+                else:
+                    arr_str.append(f"{arg},")
 
             arr_str = ' '.join(arr_str)
             debug_string = "{}{}: [{}]\n".format(debug_string, key, arr_str[:-1])
 
         # Format floats such that only 5 decimal places are shown.
-        elif type(val) in (float, np.float32, np.float64):
-
-            debug_string = "{}{}: {}\n".format(debug_string, key, locale.format_string("%7.5f", val, grouping=True))
+        elif isinstance(val, (float, np.float32, np.float64)):
+            debug_string = "{}{}: {:7.5f}\n".format(debug_string, key, val)
 
         # Print ints with comma separated thousands (locale aware).
-        elif type(val) in (int, np.int32, np.int64):
-            debug_string = "{}{}: {}\n".format(debug_string, key, locale.format_string("%d", val, grouping=True))
+        elif isinstance(val, (int, np.int32, np.int64)):
+             # Use f-string for locale aware printing if possible, or basic
+            try:
+                debug_string = "{}{}: {:n}\n".format(debug_string, key, val)
+            except ValueError:
+                debug_string = "{}{}: {}\n".format(debug_string, key, val)
+        
         # Default to just printing the value if it isn't a type we know how to format.
         else:
             debug_string = "{}{}: {}\n".format(debug_string, key, val)
