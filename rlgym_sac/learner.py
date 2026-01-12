@@ -186,7 +186,7 @@ class Learner(object):
             run_name = "rlgym-sac-run" if wandb_run_name is None else wandb_run_name
             print("Attempting to create new wandb run...")
             self.wandb_run = wandb.init(
-                project=project, group=group, config=self.config, name=run_name, finish_previous=True
+                project=project, group=group, config=self.config, name=run_name, reinit=True
             )
             print("Created new wandb run!", self.wandb_run.id)
         print("Learner successfully initialized!")
