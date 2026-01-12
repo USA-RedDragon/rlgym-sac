@@ -241,6 +241,31 @@ class Learner(object):
         finally:
             self.cleanup()
 
+    def evaluate(self):
+        """
+        Evaluation function.
+        :return: None
+        """
+        try:
+            kb = KBHit()
+            print("Press (q) to quit (after next iteration)\n")
+        except Exception as e:
+            kb = None
+            print(f"KBHit disabled (no TTY): {e}")
+
+        while True:
+            experience, collected_metrics, steps_collected, collection_time = self.agent.collect_timesteps(
+                self.ts_per_epoch
+            )
+
+            if self.metrics_logger is not None:
+                self.metrics_logger.report_metrics(collected_metrics, self.wandb_run, self.agent.cumulative_timesteps)
+
+            if kb is not None and kb.kbhit():
+                c = kb.getch()
+                if c == 'q':
+                    return
+
     def _learn(self):
         """
         Learning function. This is where the magic happens.
