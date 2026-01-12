@@ -362,6 +362,83 @@ class ReplayBuffer(BaseBuffer):
             self.full = True
             self.pos = 0
 
+    def add_batch(
+        self,
+        obs: np.ndarray,
+        next_obs: np.ndarray,
+        action: np.ndarray,
+        reward: np.ndarray,
+        done: np.ndarray,
+        infos: list[dict[str, Any]],
+    ) -> None:
+        """
+        Add a batch of transitions to the buffer (vectorized).
+        Assumes n_envs=1 for simplicity as per current usage in sac_learner.
+        Input shapes: (N, ...)
+        """
+        n_samples = obs.shape[0]
+        
+        # We might need to handle wrapping multiple times if n_samples > buffer_size
+        # But for now assume n_samples < buffer_size usually, or handle in loop
+        
+        if n_samples == 0:
+            return
+
+        # Prepare data
+        # Ensure correct shapes
+        action = action.reshape((n_samples, self.n_envs, self.action_dim))
+        reward = reward.reshape((n_samples, self.n_envs))
+        done = done.reshape((n_samples, self.n_envs))
+        obs = obs.reshape((n_samples, self.n_envs, *self.obs_shape))
+        next_obs = next_obs.reshape((n_samples, self.n_envs, *self.obs_shape))
+        
+        # Extract timeouts if needed
+        if self.handle_timeout_termination:
+             # This part is still a bit slow (list comp), but better than loop over add
+             # infos is list of list? Or list of dicts corresponding to the batch?
+             # In sac_learner calling this, infos will be a list of len N?
+             # If infos is list of len N, and each element corresponds to a step.
+             # Actually, if we vectorise, we should pass numpy array for timeouts if possible
+             # But let's assume infos is list of dicts.
+             if isinstance(infos, dict): # Handle dict of arrays case if passed
+                 timeouts = infos.get("TimeLimit.truncated", np.zeros((n_samples, self.n_envs), dtype=bool))
+             else:
+                 # Flattened loop: infos expected to be list of dicts
+                 # In sac_learner we construct it manually. 
+                 # We will modify sac_learner to pass numpy array for timeouts.
+                 timeouts = np.zeros((n_samples, self.n_envs), dtype=np.float32)
+                 # Fast path if no timeouts
+                 # Assuming passed as numpy array in infos argument for speed if possible
+                 pass 
+
+        # Vectorized ring buffer fill
+        indices = np.arange(self.pos, self.pos + n_samples) % self.buffer_size
+        
+        self.observations[indices] = obs
+        if self.optimize_memory_usage:
+            self.observations[(indices + 1) % self.buffer_size] = next_obs
+        else:
+            self.next_observations[indices] = next_obs
+            
+        self.actions[indices] = action
+        self.rewards[indices] = reward
+        self.dones[indices] = done
+        
+        if self.handle_timeout_termination:
+            # We rely on specific calling convention now or handle it later
+             # Check if we were passed a timeouts array in infos (hacky but fast)
+             if isinstance(infos, np.ndarray):
+                 self.timeouts[indices] = infos.reshape((n_samples, self.n_envs))
+             elif isinstance(infos, list) and len(infos) == n_samples:
+                 # Slow path
+                 t_list = [info.get("TimeLimit.truncated", False) for info in infos]
+                 self.timeouts[indices] = np.array(t_list).reshape((n_samples, self.n_envs))
+        
+        self.pos += n_samples
+        if self.pos >= self.buffer_size:
+            self.full = True
+            self.pos = self.pos % self.buffer_size
+
     def sample(self, batch_size: int) -> ReplayBufferSamples:
         """
         Sample elements from the replay buffer.

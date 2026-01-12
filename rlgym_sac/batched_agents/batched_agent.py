@@ -59,7 +59,7 @@ def batched_agent_process(proc_id, endpoint, shm_buffer, shm_offset, shm_size, s
 
     # Wait for initialization data from the learner.
     while env is None:
-        data = pickle.loads(pipe.recv(4096))
+        data = pickle.loads(pipe.recv(65535))
         if data[0] == "initialization_data":
             build_env_fn = data[1]
             metrics_encoding_function = data[2]

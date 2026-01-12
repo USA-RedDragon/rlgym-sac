@@ -43,6 +43,8 @@ class SACLearner:
                  learning_starts=100,
                  train_freq=1,
                  gradient_steps=1,
+                 policy_delay=1,
+                 max_updates_per_iter=None,
                  tau=0.005,
                  gamma=0.99,
                  policy_layer_sizes=(256, 256),
@@ -57,6 +59,8 @@ class SACLearner:
         self.learning_rate = learning_rate
         self.train_freq = train_freq
         self.gradient_steps = gradient_steps
+        self.policy_delay = max(1, policy_delay)
+        self.max_updates_per_iter = max_updates_per_iter if max_updates_per_iter is None else int(max_updates_per_iter)
         self.use_amp = use_amp and self.device.type == "cuda"
         self.autocast_device = "cuda"
         # Gracefully handle older torch versions that lack device_type on GradScaler
@@ -118,6 +122,19 @@ class SACLearner:
         
         self.cumulative_model_updates = 0
         self.policy = PolicyWrapper(self.actor, self.device)
+        
+        # Compile two separate graphs: one for full update, one for critic only
+        # We use default compilation (inductor) which offers good speedup without the instability of reduce-overhead/cudagraphs
+        try:
+             self._update_chunk_compiled = torch.compile(self._update_chunk_internal)
+             self._update_all_compiled = torch.compile(self._update_all_internal)
+             self._update_critic_compiled = torch.compile(self._update_critic_only_internal)
+             print("Model update functions successfully compiled with torch.compile (default).")
+        except Exception as e:
+             print(f"Failed to compile: {e}. Falling back to eager execution.")
+             self._update_chunk_compiled = self._update_chunk_internal
+             self._update_all_compiled = self._update_all_internal
+             self._update_critic_compiled = self._update_critic_only_internal
 
     def _autocast_context(self):
         try:
@@ -145,39 +162,162 @@ class SACLearner:
         dones = to_cpu_numpy(dones)
         truncated = to_cpu_numpy(truncated)
 
-        N = len(states)
+        # Vectorized addition using add_batch from modified buffers.py
+        # We pass truncated array directly as 'infos' to piggyback on the implementation
         
-        # NOTE: This loop might be slow for large batches (e.g. 50k steps).
-        # ideally we should modify ReplayBuffer to accept batches.
-        # But buffers.py is from CleanRL and assumes adding 1 step from N envs.
-        # Here we have N steps from effectively 1 flattened stream or many streams (batched agent).
-        # We treat it as sequential additions.
+        # CleanRL buffers expect (N, n_envs, ...) but we have (N, ...)
+        # add_batch handles reshaping internally assuming n_envs is consistent with buffer init (which is 1)
         
-        for i in range(N):
-            info = {}
-            if truncated[i]:
-                info["TimeLimit.truncated"] = True
+        self.replay_buffer.add_batch(
+            states,
+            next_states,
+            actions,
+            rewards,
+            dones,
+            truncated # Passed as infos
+        )
+
+    def _update_critic_logic(self, obs, act, next_obs, rew, done):
+        """Shared critic logic to avoid code duplication"""
+        with self._autocast_context():
+            with torch.no_grad():
+                current_alpha = self.log_alpha.exp().detach() if self.autotune else torch.tensor(self.alpha, device=self.device)
+                
+                next_state_actions, next_state_log_pi, _ = self.actor.get_action(next_obs)
+                qf1_next_target = self.qf1_target(next_obs, next_state_actions)
+                qf2_next_target = self.qf2_target(next_obs, next_state_actions)
+                
+                min_qf_next_target = torch.min(qf1_next_target, qf2_next_target) - current_alpha * next_state_log_pi
+                next_q_value = rew.flatten() + (1 - done.flatten()) * self.gamma * (min_qf_next_target).view(-1)
+
+            qf1_a_values = self.qf1(obs, act).view(-1)
+            qf2_a_values = self.qf2(obs, act).view(-1)
+            qf1_loss = F.mse_loss(qf1_a_values, next_q_value)
+            qf2_loss = F.mse_loss(qf2_a_values, next_q_value)
+            qf_loss = qf1_loss + qf2_loss
+
+        # set_to_none=False is required for CUDA Graphs (reduce-overhead) to keep static gradient buffers
+        self.q_optimizer.zero_grad(set_to_none=False)
+        if self.use_amp:
+            self.scaler.scale(qf_loss).backward()
+            self.scaler.step(self.q_optimizer)
+        else:
+            qf_loss.backward()
+            self.q_optimizer.step()
+        
+        return qf_loss.detach().clone(), qf1_a_values.detach().mean().clone()
+
+    def _update_critic_only_internal(self, obs, act, next_obs, rew, done):
+        qf_loss, q_val_mean = self._update_critic_logic(obs, act, next_obs, rew, done)
+        if self.use_amp:
+            self.scaler.update()
+        return qf_loss.detach().clone(), q_val_mean.detach().clone()
+
+    def _update_all_internal(self, obs, act, next_obs, rew, done):
+        # 1. Update Critic
+        qf_loss_val, q_val_mean = self._update_critic_logic(obs, act, next_obs, rew, done)
+
+        # 2. Update Actor
+        with self._autocast_context():
+            pi, log_pi, _ = self.actor.get_action(obs)
+            qf1_pi = self.qf1(obs, pi)
+            qf2_pi = self.qf2(obs, pi)
+            min_qf_pi = torch.min(qf1_pi, qf2_pi)
             
-            # ReplayBuffer expects inputs to be (n_envs, ...)
-            # We set n_envs=1 in buffer init, so we expect (1, ...)
+            # Re-fetch alpha (graph safe)
+            current_alpha = self.log_alpha.exp() if self.autotune else torch.tensor(self.alpha, device=self.device)
+            if not self.autotune:
+                 current_alpha = current_alpha.detach() # Explicit detach for fixed alpha
+
+            actor_loss = ((current_alpha * log_pi) - min_qf_pi).mean()
+
+        # set_to_none=False for CUDA Graphs
+        self.actor_optimizer.zero_grad(set_to_none=False)
+        if self.use_amp:
+            self.scaler.scale(actor_loss).backward()
+            self.scaler.step(self.actor_optimizer)
+        else:
+            actor_loss.backward()
+            self.actor_optimizer.step()
+        
+        actor_loss_val = actor_loss.detach().clone()
+
+        # 3. Update Alpha
+        alpha_val = torch.tensor(0.0, device=self.device)
+        alpha_loss_val = torch.tensor(0.0, device=self.device)
+
+        if self.autotune:
+            with self._autocast_context():
+                with torch.no_grad():
+                    _, log_pi_alpha, _ = self.actor.get_action(obs)
+                alpha_loss = (-self.log_alpha.exp() * (log_pi_alpha + self.target_entropy)).mean()
+
+            # set_to_none=False for CUDA Graphs
+            self.a_optimizer.zero_grad(set_to_none=False)
+            if self.use_amp:
+                self.scaler.scale(alpha_loss).backward()
+                self.scaler.step(self.a_optimizer)
+            else:
+                alpha_loss.backward()
+                self.a_optimizer.step()
             
-            self.replay_buffer.add(
-                states[i][None, ...],      
-                next_states[i][None, ...], 
-                actions[i][None, ...],     
-                rewards[i].reshape(1),     
-                dones[i].reshape(1),       
-                [info]
-            )
+            alpha_loss_val = alpha_loss.detach().clone()
+            alpha_val = self.log_alpha.exp().detach().clone()
+        else:
+            alpha_val = torch.tensor(self.alpha, device=self.device)
+
+        if self.use_amp:
+            self.scaler.update()
+
+        # 4. Update Targets
+        with torch.no_grad():
+            for param, target_param in zip(self.qf1.parameters(), self.qf1_target.parameters()):
+                target_param.data.lerp_(param.data, self.tau)
+            for param, target_param in zip(self.qf2.parameters(), self.qf2_target.parameters()):
+                target_param.data.lerp_(param.data, self.tau)
+
+        return qf_loss_val, actor_loss_val, alpha_loss_val, q_val_mean, alpha_val
+
+    def _update_chunk_internal(self, obs_chunk, act_chunk, next_obs_chunk, rew_chunk, done_chunk, chunk_size):
+        qf_loss_sum = torch.tensor(0.0, device=self.device)
+        actor_loss_sum = torch.tensor(0.0, device=self.device)
+        alpha_loss_sum = torch.tensor(0.0, device=self.device)
+        q_val_sum = torch.tensor(0.0, device=self.device)
+        
+        for i in range(chunk_size):
+            obs, act, next_obs, rew, done = obs_chunk[i], act_chunk[i], next_obs_chunk[i], rew_chunk[i], done_chunk[i]
+            
+            # Assume strict alignment of chunk updates to policy_delay
+            # Caller must ensure chunk_size is multiple of policy_delay and start_idx is aligned
+            if i % self.policy_delay == 0:
+                qf, act_l, alph_l, qv, _ = self._update_all_internal(obs, act, next_obs, rew, done)
+                qf_loss_sum += qf
+                actor_loss_sum += act_l
+                alpha_loss_sum += alph_l
+                q_val_sum += qv
+            else:
+                qf, qv = self._update_critic_only_internal(obs, act, next_obs, rew, done)
+                qf_loss_sum += qf
+                q_val_sum += qv
+                
+        return qf_loss_sum, actor_loss_sum, alpha_loss_sum, q_val_sum
 
     def learn(self, steps_collected):
         if self.replay_buffer.size() < self.learning_starts:
             return {}
         
-        qf_losses = []
-        actor_losses = []
-        alpha_losses = []
-        q_vals = []
+        # Accumulators on GPU
+        qf_loss_sum = torch.tensor(0.0, device=self.device)
+        actor_loss_sum = torch.tensor(0.0, device=self.device)
+        alpha_loss_sum = torch.tensor(0.0, device=self.device)
+        q_val_sum = torch.tensor(0.0, device=self.device)
+        actor_updates_count = torch.tensor(0.0, device=self.device)
+        
+        # Timers
+        update_time = 0.0
+        sample_time = 0.0
+        reshape_time = 0.0
+        step_time = 0.0
         
         # Calculate how many updates to perform
         # Total updates = (steps_collected / train_freq) * gradient_steps
@@ -186,91 +326,104 @@ class SACLearner:
         else:
             updates_to_perform = self.gradient_steps # Fallback if train_freq is 0/invalid
 
-        for _ in range(updates_to_perform):
-            data = self.replay_buffer.sample(self.batch_size)
+        if self.max_updates_per_iter is not None:
+            updates_to_perform = min(updates_to_perform, self.max_updates_per_iter)
+
+        # Optimization: Sample everything at once (or in large chunks)
+        # We chunk into small blocks to utilize the compiled chunk function which unrolls the loop
+        
+        CHUNK_SIZE = 120 # Higher chunk size (multiple of policy_delay=3) to amortize kernel launches
+        update_idx = 0
+        
+        t0_total = time.perf_counter()
+
+        while update_idx < updates_to_perform:
+            current_chunk = min(CHUNK_SIZE, updates_to_perform - update_idx)
             
-            # --- Update Q functions ---
-            with self._autocast_context():
-                with torch.no_grad():
-                    next_state_actions, next_state_log_pi, _ = self.actor.get_action(data.next_observations)
-                    qf1_next_target = self.qf1_target(data.next_observations, next_state_actions)
-                    qf2_next_target = self.qf2_target(data.next_observations, next_state_actions)
+            t0_sample = time.perf_counter()
+            # Sample
+            data = self.replay_buffer.sample(self.batch_size * current_chunk)
+            t1_sample = time.perf_counter()
+            sample_time += (t1_sample - t0_sample)
+            
+            # Reshape data to (Chunk, Batch, Dim)
+            def reshape_tensor(x):
+                new_shape = (current_chunk, self.batch_size) + x.shape[1:]
+                return x.view(new_shape)
+
+            obs_chunk = reshape_tensor(data.observations)
+            act_chunk = reshape_tensor(data.actions)
+            next_obs_chunk = reshape_tensor(data.next_observations)
+            rew_chunk = reshape_tensor(data.rewards)
+            done_chunk = reshape_tensor(data.dones)
+            t2_reshape = time.perf_counter()
+            reshape_time += (t2_reshape - t1_sample)
+            
+            if current_chunk == CHUNK_SIZE and update_idx % self.policy_delay == 0:
+                # Use the compiled chunk update
+                # Requirement: chunk_size MUST be multiple of policy_delay to maintain alignment
+                # CHUNK_SIZE (120) is divisible by 1, 2, 3, 4, 5, 6... very safe.
+                
+                qf, act_l, alph_l, qv = self._update_chunk_compiled(
+                    obs_chunk, act_chunk, next_obs_chunk, rew_chunk, done_chunk,
+                    CHUNK_SIZE
+                )
+                qf_loss_sum += qf
+                actor_loss_sum += act_l
+                alpha_loss_sum += alph_l
+                q_val_sum += qv
+                
+                # Count actor updates in this chunk
+                # Since we aligned start to 0 mod delay, and chunk is assumed multiple, 
+                # count is just CHUNK_SIZE / delay
+                actor_updates_count += (CHUNK_SIZE // self.policy_delay)
+                
+            else:
+                # Use the individual compiled functions for the remainder
+                for i in range(current_chunk):
+                    # Slicing is fast (view)
+                    obs, act, next_obs, rew, done = obs_chunk[i], act_chunk[i], next_obs_chunk[i], rew_chunk[i], done_chunk[i]
                     
-                    min_qf_next_target = torch.min(qf1_next_target, qf2_next_target) - self.alpha * next_state_log_pi
-                    next_q_value = data.rewards.flatten() + (1 - data.dones.flatten()) * self.gamma * (min_qf_next_target).view(-1)
+                    global_update_idx = update_idx + i
+                    if global_update_idx % self.policy_delay == 0:
+                        qf, act_l, alph_l, qv, new_a = self._update_all_compiled(obs, act, next_obs, rew, done)
+                        
+                        qf_loss_sum += qf
+                        actor_loss_sum += act_l
+                        alpha_loss_sum += alph_l
+                        q_val_sum += qv
+                        actor_updates_count += 1
+                    else:
+                        qf, qv = self._update_critic_compiled(obs, act, next_obs, rew, done)
+                        qf_loss_sum += qf
+                        q_val_sum += qv
 
-                qf1_a_values = self.qf1(data.observations, data.actions).view(-1)
-                qf2_a_values = self.qf2(data.observations, data.actions).view(-1)
-                qf1_loss = F.mse_loss(qf1_a_values, next_q_value)
-                qf2_loss = F.mse_loss(qf2_a_values, next_q_value)
-                qf_loss = qf1_loss + qf2_loss
-
-            self.q_optimizer.zero_grad()
-            if self.use_amp:
-                self.scaler.scale(qf_loss).backward()
-                self.scaler.step(self.q_optimizer)
-            else:
-                qf_loss.backward()
-                self.q_optimizer.step()
+            step_time += (time.perf_counter() - t2_reshape)
+            update_idx += current_chunk
+            self.cumulative_model_updates += current_chunk
             
-            qf_losses.append(qf_loss.item())
-            q_vals.append(qf1_a_values.mean().item())
+        t1_total = time.perf_counter()
+        update_time = t1_total - t0_total
 
-            # --- Update Actor ---
-            # TODO: Add policy delay support if needed (CleanRL has it, we can expose it)
-            # For now updating every step
-            
-            with self._autocast_context():
-                pi, log_pi, _ = self.actor.get_action(data.observations)
-                qf1_pi = self.qf1(data.observations, pi)
-                qf2_pi = self.qf2(data.observations, pi)
-                min_qf_pi = torch.min(qf1_pi, qf2_pi)
-                actor_loss = ((self.alpha * log_pi) - min_qf_pi).mean()
+        # Sync metrics at the very end
+        steps = updates_to_perform
+        actor_steps = actor_updates_count.item()
+        
+        # If autotune, we need the latest alpha value.
+        # We can just read it from the optimizer / log_alpha at the end.
+        if self.autotune:
+            self.alpha = self.log_alpha.exp().item()
 
-            self.actor_optimizer.zero_grad()
-            if self.use_amp:
-                self.scaler.scale(actor_loss).backward()
-                self.scaler.step(self.actor_optimizer)
-            else:
-                actor_loss.backward()
-                self.actor_optimizer.step()
-            
-            actor_losses.append(actor_loss.item())
-
-            # --- Update Alpha ---
-            if self.autotune:
-                with self._autocast_context():
-                    with torch.no_grad():
-                        _, log_pi, _ = self.actor.get_action(data.observations)
-                    alpha_loss = (-self.log_alpha.exp() * (log_pi + self.target_entropy)).mean()
-
-                self.a_optimizer.zero_grad()
-                if self.use_amp:
-                    self.scaler.scale(alpha_loss).backward()
-                    self.scaler.step(self.a_optimizer)
-                else:
-                    alpha_loss.backward()
-                    self.a_optimizer.step()
-                self.alpha = self.log_alpha.exp().item()
-                alpha_losses.append(alpha_loss.item())
-
-            if self.use_amp:
-                self.scaler.update()
-
-            # --- Update Target Networks ---
-            for param, target_param in zip(self.qf1.parameters(), self.qf1_target.parameters()):
-                target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
-            for param, target_param in zip(self.qf2.parameters(), self.qf2_target.parameters()):
-                target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
-            
-            self.cumulative_model_updates += 1
-            
         return {
-            "Value Function Loss": np.mean(qf_losses),
-            "Policy Loss": np.mean(actor_losses),
+            "Value Function Loss": (qf_loss_sum / steps).item(),
+            "Policy Loss": (actor_loss_sum / max(actor_steps, 1)).item(),
             "Alpha": self.alpha,
-            "Alpha Loss": np.mean(alpha_losses) if alpha_losses else 0.0,
-            "Mean Q Value": np.mean(q_vals)
+            "Alpha Loss": (alpha_loss_sum / max(actor_steps, 1)).item(),
+            "Mean Q Value": (q_val_sum / steps).item(),
+            "Update Time": update_time,
+            "Sample Time": sample_time,
+            "Reshape Time": reshape_time,
+            "Step Time": step_time,
         }
 
     def save_to(self, folder_path):
