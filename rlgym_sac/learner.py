@@ -39,7 +39,7 @@ class Learner(object):
             exp_buffer_size: int = 1_000_000,
             ts_per_iteration: int = 50000,
             standardize_returns: bool = True,
-            standardize_obs: bool = True,
+            standardize_obs: bool = False,
             max_returns_per_stats_increment: int = 150,
             steps_per_obs_stats_increment: int = 5,
 
@@ -185,7 +185,7 @@ class Learner(object):
             run_name = "rlgym-sac-run" if wandb_run_name is None else wandb_run_name
             print("Attempting to create new wandb run...")
             self.wandb_run = wandb.init(
-                project=project, group=group, config=self.config, name=run_name, reinit=True
+                project=project, group=group, config=self.config, name=run_name, finish_previous=True
             )
             print("Created new wandb run!", self.wandb_run.id)
         print("Learner successfully initialized!")
