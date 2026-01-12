@@ -26,6 +26,7 @@ setup(
         'gym>0.23',
         'numpy>1.21',
         'rlviser-py>=0.6.13',
+        'rocketsim>=2.1.1.post4',
         'torch>1.13',
         'wandb>0.15',
     ],
