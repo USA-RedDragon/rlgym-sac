@@ -2,6 +2,16 @@ import gymnasium as gym
 import numpy as np
 
 
+class ParsedGameState:
+    def __init__(self, state):
+        self._state = state
+        self._reward_breakdown = {}
+        self._reward_names = []
+
+    def __getattr__(self, name):
+        return getattr(self._state, name)
+
+
 class RLGymV2GymWrapper(object):
     def __init__(self, rlgym_env):
         self.rlgym_env = rlgym_env
@@ -129,7 +139,15 @@ class RLGymV2GymWrapper(object):
         self.obs_buffer = np.asarray(obs_vec)
         
         # Info is tricky, RLGym v2 doesn't pass a unified info dict, but state is accessible
-        info = {"state": self.rlgym_env.state}
+        # Since rlgym v2 GameState is often immutable/slotted, wrap it to allow attaching metrics info
+        state_wrapper = ParsedGameState(self.rlgym_env.state)
+        
+        if hasattr(self.rlgym_env, 'shared_info'):
+            # Attach shared info to the state if possible to access it for metrics later
+            state_wrapper._reward_breakdown = self.rlgym_env.shared_info.get("reward_breakdown", {})
+            state_wrapper._reward_names = self.rlgym_env.shared_info.get("reward_names", [])
+
+        info = {"state": state_wrapper}
         return self.obs_buffer, rews, done, truncated, info
 
     def render(self):
