@@ -74,7 +74,8 @@ class Learner(object):
             n_checkpoints_to_keep: int = 5,
             shm_buffer_size: int = 8192,
             device: str = "auto",
-            use_amp: bool = True):
+            use_amp: bool = True,
+            sac_compile: bool = False):
 
         assert (
                 env_create_function is not None
@@ -157,6 +158,7 @@ class Learner(object):
             policy_layer_sizes=policy_layer_sizes,
             critic_layer_sizes=critic_layer_sizes,
             use_amp=self.use_amp,
+            compile=sac_compile,
         )
 
         self.agent.policy = self.sac_learner.policy
@@ -181,6 +183,7 @@ class Learner(object):
             "sac_gamma": sac_gamma,
             "shm_buffer_size": shm_buffer_size,
             "use_amp": use_amp,
+            "sac_compile": sac_compile,
         }
 
         self.wandb_run = wandb_run

@@ -50,7 +50,8 @@ class SACLearner:
                  gamma=0.99,
                  policy_layer_sizes=(256, 256),
                  critic_layer_sizes=(256, 256),
-                 use_amp=True):
+                 use_amp=True,
+                 compile=False):
         
         self.device = torch.device(device if device != "auto" else ("cuda" if torch.cuda.is_available() else "cpu"))
         
@@ -132,15 +133,22 @@ class SACLearner:
              # This removes Python overhead for those steps and allows Inductor to optimize dependencies.
              # We avoid "reduce-overhead" to prevent memory overwrite crashes.
              
-             compile_mode = "default"
-             
-             self._update_chunk_compiled = torch.compile(self._update_chunk_internal, mode=compile_mode)
-             # We can keep the single step one for remainders if needed, but easier to just use chunks + remainder handling in Eager or unoptimised.
-             # Actually, we will force all updates to be chunks or small chunks.
-             self._update_all_internal_compiled = torch.compile(self._update_all_internal, mode=compile_mode) # For remainders
-             self._update_critic_internal_compiled = torch.compile(self._update_critic_only_internal, mode=compile_mode) # For remainders
+             if compile:
+                 compile_mode = "default"
+                 
+                 self._update_chunk_compiled = torch.compile(self._update_chunk_internal, mode=compile_mode)
+                 # We can keep the single step one for remainders if needed, but easier to just use chunks + remainder handling in Eager or unoptimised.
+                 # Actually, we will force all updates to be chunks or small chunks.
+                 self._update_all_internal_compiled = torch.compile(self._update_all_internal, mode=compile_mode) # For remainders
+                 self._update_critic_internal_compiled = torch.compile(self._update_critic_only_internal, mode=compile_mode) # For remainders
 
-             print(f"Model update functions successfully compiled. Mode: {compile_mode}")
+                 print(f"Model update functions successfully compiled. Mode: {compile_mode}")
+             else:
+                 print("Compilation disabled. Using eager execution.")
+                 self._update_chunk_compiled = self._update_chunk_internal
+                 self._update_all_internal_compiled = self._update_all_internal
+                 self._update_critic_internal_compiled = self._update_critic_only_internal
+
         except Exception as e:
              print(f"Failed to compile: {e}. Falling back to eager execution.")
              self._update_chunk_compiled = self._update_chunk_internal
