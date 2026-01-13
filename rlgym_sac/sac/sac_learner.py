@@ -1,10 +1,11 @@
 import os
+os.environ["TORCHDYNAMO_INLINE_INBUILT_NN_MODULES"] = "1"
 import time
 import numpy as np
 import torch
 import torch.nn.functional as F
 import torch.optim as optim
-from torch.amp import GradScaler, autocast
+from torch.amp import autocast
 import gymnasium as gym
 
 # CleanRL imports
@@ -36,7 +37,7 @@ class SACLearner:
                  obs_space_size,
                  act_space_size,
                  device="auto",
-                 batch_size=256,
+                 batch_size=1024,
                  ent_coef="auto",
                  learning_rate=3e-4,
                  buffer_size=1_000_000,
@@ -52,6 +53,11 @@ class SACLearner:
                  use_amp=True):
         
         self.device = torch.device(device if device != "auto" else ("cuda" if torch.cuda.is_available() else "cpu"))
+        
+        # Set TF32 precision if available (typical for 3090/Ampere cards)
+        if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8:
+             torch.set_float32_matmul_precision('high')
+
         self.batch_size = batch_size
         self.learning_starts = learning_starts
         self.tau = tau
@@ -61,15 +67,11 @@ class SACLearner:
         self.gradient_steps = gradient_steps
         self.policy_delay = max(1, policy_delay)
         self.max_updates_per_iter = max_updates_per_iter if max_updates_per_iter is None else int(max_updates_per_iter)
-        self.use_amp = use_amp and self.device.type == "cuda"
-        self.autocast_device = "cuda"
-        # Gracefully handle older torch versions that lack device_type on GradScaler
-        try:
-            self.scaler = GradScaler(device_type=self.autocast_device, enabled=self.use_amp)
-            self._use_device_type_ctx = True
-        except TypeError:
-            self.scaler = GradScaler(enabled=self.use_amp)
-            self._use_device_type_ctx = False
+        
+        # LeanRL alignment: AMP/GradScaler disabled to avoid graph overwrite errors with reduced overhead compilation.
+        # We rely on TF32 (set above) for speed on Ampere+ GPUs.
+        self.use_amp = False 
+        self.autocast_device = "cuda" # Still used for autocast context if needed (though disabled)
         
         # Define spaces for CleanRL classes
         # cleanrl buffers expects gymnasium spaces
@@ -124,15 +126,28 @@ class SACLearner:
         self.policy = PolicyWrapper(self.actor, self.device)
         
         # Compile two separate graphs: one for full update, one for critic only
-        # We use default compilation (inductor) which offers good speedup without the instability of reduce-overhead/cudagraphs
         try:
-             self._update_chunk_compiled = torch.compile(self._update_chunk_internal)
-             self._update_all_compiled = torch.compile(self._update_all_internal)
-             self._update_critic_compiled = torch.compile(self._update_critic_only_internal)
-             print("Model update functions successfully compiled with torch.compile (default).")
+             # Strategy: Compile a "Chunk" update using Inductor ("default" mode).
+             # We execute a loop of small chunks (e.g. 32 steps) inside the compiled function.
+             # This removes Python overhead for those steps and allows Inductor to optimize dependencies.
+             # We avoid "reduce-overhead" to prevent memory overwrite crashes.
+             
+             compile_mode = "default"
+             
+             self._update_chunk_compiled = torch.compile(self._update_chunk_internal, mode=compile_mode)
+             # We can keep the single step one for remainders if needed, but easier to just use chunks + remainder handling in Eager or unoptimised.
+             # Actually, we will force all updates to be chunks or small chunks.
+             self._update_all_internal_compiled = torch.compile(self._update_all_internal, mode=compile_mode) # For remainders
+             self._update_critic_internal_compiled = torch.compile(self._update_critic_only_internal, mode=compile_mode) # For remainders
+
+             print(f"Model update functions successfully compiled. Mode: {compile_mode}")
         except Exception as e:
              print(f"Failed to compile: {e}. Falling back to eager execution.")
              self._update_chunk_compiled = self._update_chunk_internal
+             self._update_all_internal_compiled = self._update_all_internal
+             self._update_critic_internal_compiled = self._update_critic_only_internal
+        except Exception as e:
+             print(f"Failed to compile: {e}. Falling back to eager execution.")
              self._update_all_compiled = self._update_all_internal
              self._update_critic_compiled = self._update_critic_only_internal
 
@@ -147,26 +162,8 @@ class SACLearner:
         
         # Efficiently add batch of experience to buffer.
         # rlgym-ppo experience is (N, ...)
-        # ReplayBuffer.add expects (n_envs, ...) and numpy inputs
         
-        # Convert to numpy if they are tensors (which they likely are from BatchedManager)
-        def to_cpu_numpy(x):
-            if isinstance(x, torch.Tensor):
-                return x.cpu().numpy()
-            return x
-            
-        states = to_cpu_numpy(states)
-        actions = to_cpu_numpy(actions)
-        rewards = to_cpu_numpy(rewards)
-        next_states = to_cpu_numpy(next_states)
-        dones = to_cpu_numpy(dones)
-        truncated = to_cpu_numpy(truncated)
-
-        # Vectorized addition using add_batch from modified buffers.py
-        # We pass truncated array directly as 'infos' to piggyback on the implementation
-        
-        # CleanRL buffers expect (N, n_envs, ...) but we have (N, ...)
-        # add_batch handles reshaping internally assuming n_envs is consistent with buffer init (which is 1)
+        # We pass data directly to ReplayBuffer. It handles conversion/reshaping.
         
         self.replay_buffer.add_batch(
             states,
@@ -196,21 +193,15 @@ class SACLearner:
             qf2_loss = F.mse_loss(qf2_a_values, next_q_value)
             qf_loss = qf1_loss + qf2_loss
 
-        # set_to_none=False is required for CUDA Graphs (reduce-overhead) to keep static gradient buffers
-        self.q_optimizer.zero_grad(set_to_none=False)
-        if self.use_amp:
-            self.scaler.scale(qf_loss).backward()
-            self.scaler.step(self.q_optimizer)
-        else:
-            qf_loss.backward()
-            self.q_optimizer.step()
+        # Standard zero_grad (set_to_none=True is default and slightly faster)
+        self.q_optimizer.zero_grad()
+        qf_loss.backward()
+        self.q_optimizer.step()
         
         return qf_loss.detach().clone(), qf1_a_values.detach().mean().clone()
 
     def _update_critic_only_internal(self, obs, act, next_obs, rew, done):
         qf_loss, q_val_mean = self._update_critic_logic(obs, act, next_obs, rew, done)
-        if self.use_amp:
-            self.scaler.update()
         return qf_loss.detach().clone(), q_val_mean.detach().clone()
 
     def _update_all_internal(self, obs, act, next_obs, rew, done):
@@ -233,12 +224,8 @@ class SACLearner:
 
         # set_to_none=False for CUDA Graphs
         self.actor_optimizer.zero_grad(set_to_none=False)
-        if self.use_amp:
-            self.scaler.scale(actor_loss).backward()
-            self.scaler.step(self.actor_optimizer)
-        else:
-            actor_loss.backward()
-            self.actor_optimizer.step()
+        actor_loss.backward()
+        self.actor_optimizer.step()
         
         actor_loss_val = actor_loss.detach().clone()
 
@@ -254,20 +241,13 @@ class SACLearner:
 
             # set_to_none=False for CUDA Graphs
             self.a_optimizer.zero_grad(set_to_none=False)
-            if self.use_amp:
-                self.scaler.scale(alpha_loss).backward()
-                self.scaler.step(self.a_optimizer)
-            else:
-                alpha_loss.backward()
-                self.a_optimizer.step()
+            alpha_loss.backward()
+            self.a_optimizer.step()
             
             alpha_loss_val = alpha_loss.detach().clone()
             alpha_val = self.log_alpha.exp().detach().clone()
         else:
             alpha_val = torch.tensor(self.alpha, device=self.device)
-
-        if self.use_amp:
-            self.scaler.update()
 
         # 4. Update Targets
         with torch.no_grad():
@@ -279,6 +259,7 @@ class SACLearner:
         return qf_loss_val, actor_loss_val, alpha_loss_val, q_val_mean, alpha_val
 
     def _update_chunk_internal(self, obs_chunk, act_chunk, next_obs_chunk, rew_chunk, done_chunk, chunk_size):
+        # We loop internally to allow Inductor to trace and fuse the loop.
         qf_loss_sum = torch.tensor(0.0, device=self.device)
         actor_loss_sum = torch.tensor(0.0, device=self.device)
         alpha_loss_sum = torch.tensor(0.0, device=self.device)
@@ -287,8 +268,9 @@ class SACLearner:
         for i in range(chunk_size):
             obs, act, next_obs, rew, done = obs_chunk[i], act_chunk[i], next_obs_chunk[i], rew_chunk[i], done_chunk[i]
             
-            # Assume strict alignment of chunk updates to policy_delay
-            # Caller must ensure chunk_size is multiple of policy_delay and start_idx is aligned
+            # This logic assumes the chunk is aligned such that index 0 is a policy update specific index
+            # But simpler: check mod delay.
+            # However, if we compile with a fixed loop, 'i' is constant per step in the unroll.
             if i % self.policy_delay == 0:
                 qf, act_l, alph_l, qv, _ = self._update_all_internal(obs, act, next_obs, rew, done)
                 qf_loss_sum += qf
@@ -329,26 +311,41 @@ class SACLearner:
         if self.max_updates_per_iter is not None:
             updates_to_perform = min(updates_to_perform, self.max_updates_per_iter)
 
-        # Optimization: Sample everything at once (or in large chunks)
-        # We chunk into small blocks to utilize the compiled chunk function which unrolls the loop
+        # Optimization: Compiled Chunk Update
+        # Block size for compiled execution.
+        # Larger blocks = less Python overhead, but longer compilation times and potential instruction limit issues.
+        # 64-128 is usually the sweet spot for Inductor fusion.
         
-        CHUNK_SIZE = 120 # Higher chunk size (multiple of policy_delay=3) to amortize kernel launches
+        CHUNK_SIZE = 128
+        if CHUNK_SIZE % self.policy_delay != 0:
+            CHUNK_SIZE = (CHUNK_SIZE // self.policy_delay) * self.policy_delay
+        
         update_idx = 0
         
         t0_total = time.perf_counter()
-
+        
+        # Pre-calculate chunk ranges to avoid python overhead in loop
+        # But we still sample iteratively to avoid massive allocations?
+        # Actually sampling 4096 items is fine.
+        
+        # Important: Sample in larger batches to reduce buffer overhead if convenient.
+        # Current data collection is ~40k SPS. Consumption is 2.5k SPS.
+        # Buffer IO is fast (0.004s). Processing is matching compute limits.
+        
         while update_idx < updates_to_perform:
-            current_chunk = min(CHUNK_SIZE, updates_to_perform - update_idx)
+            # If we have enough for a full chunk, do it
+            current_is_full_chunk = (updates_to_perform - update_idx) >= CHUNK_SIZE
+            current_steps = CHUNK_SIZE if current_is_full_chunk else (updates_to_perform - update_idx)
             
             t0_sample = time.perf_counter()
             # Sample
-            data = self.replay_buffer.sample(self.batch_size * current_chunk)
+            data = self.replay_buffer.sample(self.batch_size * current_steps)
             t1_sample = time.perf_counter()
             sample_time += (t1_sample - t0_sample)
             
             # Reshape data to (Chunk, Batch, Dim)
             def reshape_tensor(x):
-                new_shape = (current_chunk, self.batch_size) + x.shape[1:]
+                new_shape = (current_steps, self.batch_size) + x.shape[1:]
                 return x.view(new_shape)
 
             obs_chunk = reshape_tensor(data.observations)
@@ -359,48 +356,46 @@ class SACLearner:
             t2_reshape = time.perf_counter()
             reshape_time += (t2_reshape - t1_sample)
             
-            if current_chunk == CHUNK_SIZE and update_idx % self.policy_delay == 0:
-                # Use the compiled chunk update
-                # Requirement: chunk_size MUST be multiple of policy_delay to maintain alignment
-                # CHUNK_SIZE (120) is divisible by 1, 2, 3, 4, 5, 6... very safe.
-                
+            if current_is_full_chunk:
+                # Use the compiled chunk function
+                # We align 'i' in the loop starts at 0.
+                # So we must ensure the global `update_idx` doesn't desync the policy delay check.
+                # However, if CHUNK_SIZE is multiple of policy_delay, 
+                # then (update_idx) % policy_delay == (update_idx + chunk) % policy_delay
+                # So if we start at 0, we remain aligned.
                 qf, act_l, alph_l, qv = self._update_chunk_compiled(
                     obs_chunk, act_chunk, next_obs_chunk, rew_chunk, done_chunk,
-                    CHUNK_SIZE
+                    CHUNK_SIZE 
                 )
                 qf_loss_sum += qf
                 actor_loss_sum += act_l
                 alpha_loss_sum += alph_l
                 q_val_sum += qv
                 
-                # Count actor updates in this chunk
-                # Since we aligned start to 0 mod delay, and chunk is assumed multiple, 
-                # count is just CHUNK_SIZE / delay
                 actor_updates_count += (CHUNK_SIZE // self.policy_delay)
                 
             else:
-                # Use the individual compiled functions for the remainder
-                for i in range(current_chunk):
-                    # Slicing is fast (view)
+                # Fallback Loop for remainder
+                for i in range(current_steps):
                     obs, act, next_obs, rew, done = obs_chunk[i], act_chunk[i], next_obs_chunk[i], rew_chunk[i], done_chunk[i]
                     
                     global_update_idx = update_idx + i
+                    
                     if global_update_idx % self.policy_delay == 0:
-                        qf, act_l, alph_l, qv, new_a = self._update_all_compiled(obs, act, next_obs, rew, done)
-                        
+                        qf, act_l, alph_l, qv, _ = self._update_all_internal_compiled(obs, act, next_obs, rew, done)
                         qf_loss_sum += qf
                         actor_loss_sum += act_l
                         alpha_loss_sum += alph_l
                         q_val_sum += qv
-                        actor_updates_count += 1
+                        actor_updates_count += 1.0
                     else:
-                        qf, qv = self._update_critic_compiled(obs, act, next_obs, rew, done)
+                        qf, qv = self._update_critic_internal_compiled(obs, act, next_obs, rew, done)
                         qf_loss_sum += qf
                         q_val_sum += qv
-
+            
             step_time += (time.perf_counter() - t2_reshape)
-            update_idx += current_chunk
-            self.cumulative_model_updates += current_chunk
+            update_idx += current_steps
+            self.cumulative_model_updates += current_steps
             
         t1_total = time.perf_counter()
         update_time = t1_total - t0_total

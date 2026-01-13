@@ -255,7 +255,8 @@ class Learner(object):
                  batch_rewards = rewards.flatten() # assuming numpy
                  # Just increment stats
                  n_to_increment = min(self.max_returns_per_stats_increment, len(batch_rewards))
-                 self.return_stats.increment(batch_rewards[:n_to_increment], n_to_increment)
+                 if n_to_increment > 0:
+                     self.return_stats.increment(batch_rewards[:n_to_increment], n_to_increment)
 
             # Train SAC
             # We collected 'steps_collected' new steps.

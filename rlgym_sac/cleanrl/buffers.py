@@ -290,22 +290,35 @@ class ReplayBuffer(BaseBuffer):
             )
         self.optimize_memory_usage = optimize_memory_usage
 
-        self.observations = np.zeros((self.buffer_size, self.n_envs, *self.obs_shape), dtype=observation_space.dtype)
+        self.gpu_storage = (self.device.type == "cuda")
+        def alloc(shape, dtype):
+            if self.gpu_storage:
+                # Basic dtype mapping
+                if dtype == np.bool_: t_dtype = th.bool
+                elif dtype == np.float64: t_dtype = th.float32 # Force float32
+                elif dtype == np.float32: t_dtype = th.float32
+                elif dtype == np.int64: t_dtype = th.int64
+                elif dtype == np.int32: t_dtype = th.int32
+                else: t_dtype = th.float32
+                return th.zeros(shape, dtype=t_dtype, device=self.device)
+            return np.zeros(shape, dtype=dtype)
+
+        self.observations = alloc((self.buffer_size, self.n_envs, *self.obs_shape), observation_space.dtype)
 
         if not optimize_memory_usage:
             # When optimizing memory, `observations` contains also the next observation
-            self.next_observations = np.zeros((self.buffer_size, self.n_envs, *self.obs_shape), dtype=observation_space.dtype)
+            self.next_observations = alloc((self.buffer_size, self.n_envs, *self.obs_shape), observation_space.dtype)
 
-        self.actions = np.zeros(
-            (self.buffer_size, self.n_envs, self.action_dim), dtype=self._maybe_cast_dtype(action_space.dtype)
+        self.actions = alloc(
+            (self.buffer_size, self.n_envs, self.action_dim), self._maybe_cast_dtype(action_space.dtype)
         )
 
-        self.rewards = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
-        self.dones = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
+        self.rewards = alloc((self.buffer_size, self.n_envs), np.float32)
+        self.dones = alloc((self.buffer_size, self.n_envs), np.float32)
         # Handle timeouts termination properly if needed
         # see https://github.com/DLR-RM/stable-baselines3/issues/284
         self.handle_timeout_termination = handle_timeout_termination
-        self.timeouts = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
+        self.timeouts = alloc((self.buffer_size, self.n_envs), np.float32)
 
         if psutil is not None:
             total_memory_usage: float = (
@@ -384,13 +397,25 @@ class ReplayBuffer(BaseBuffer):
         if n_samples == 0:
             return
 
+        # Normalized to storage device/type
+        if self.gpu_storage:
+             def to_s(x): 
+                 if isinstance(x, np.ndarray): t = th.from_numpy(x).to(self.device)
+                 elif isinstance(x, th.Tensor): t = x.to(self.device)
+                 else: t = th.as_tensor(x, device=self.device)
+                 # Force float32 for doubles to match buffer storage
+                 if t.dtype == th.float64: return t.float()
+                 return t
+        else:
+             def to_s(x): return x.cpu().numpy() if isinstance(x, th.Tensor) else np.array(x)
+
         # Prepare data
         # Ensure correct shapes
-        action = action.reshape((n_samples, self.n_envs, self.action_dim))
-        reward = reward.reshape((n_samples, self.n_envs))
-        done = done.reshape((n_samples, self.n_envs))
-        obs = obs.reshape((n_samples, self.n_envs, *self.obs_shape))
-        next_obs = next_obs.reshape((n_samples, self.n_envs, *self.obs_shape))
+        action = to_s(action).reshape((n_samples, self.n_envs, self.action_dim))
+        reward = to_s(reward).reshape((n_samples, self.n_envs))
+        done = to_s(done).reshape((n_samples, self.n_envs))
+        obs = to_s(obs).reshape((n_samples, self.n_envs, *self.obs_shape))
+        next_obs = to_s(next_obs).reshape((n_samples, self.n_envs, *self.obs_shape))
         
         # Extract timeouts if needed
         if self.handle_timeout_termination:
@@ -427,8 +452,8 @@ class ReplayBuffer(BaseBuffer):
         if self.handle_timeout_termination:
             # We rely on specific calling convention now or handle it later
              # Check if we were passed a timeouts array in infos (hacky but fast)
-             if isinstance(infos, np.ndarray):
-                 self.timeouts[indices] = infos.reshape((n_samples, self.n_envs))
+             if isinstance(infos, (np.ndarray, th.Tensor)):
+                 self.timeouts[indices] = to_s(infos).reshape((n_samples, self.n_envs))
              elif isinstance(infos, list) and len(infos) == n_samples:
                  # Slow path
                  t_list = [info.get("TimeLimit.truncated", False) for info in infos]
@@ -442,13 +467,18 @@ class ReplayBuffer(BaseBuffer):
     def sample(self, batch_size: int) -> ReplayBufferSamples:
         """
         Sample elements from the replay buffer.
-        Custom sampling when using memory efficient variant,
-        as we should not sample the element with index `self.pos`
-        See https://github.com/DLR-RM/stable-baselines3/pull/28#issuecomment-637559274
-
-        :param batch_size: Number of element to sample
-        :return:
         """
+        if self.gpu_storage:
+            upper_bound = self.buffer_size if self.full else self.pos
+            if not self.optimize_memory_usage:
+                batch_inds = th.randint(0, upper_bound, (batch_size,), device=self.device)
+            else:
+                if self.full:
+                     batch_inds = (th.randint(1, self.buffer_size, (batch_size,), device=self.device) + self.pos) % self.buffer_size
+                else:
+                     batch_inds = th.randint(0, self.pos, (batch_size,), device=self.device)
+            return self._get_samples(batch_inds)
+
         if not self.optimize_memory_usage:
             return super().sample(batch_size=batch_size)
         # Do not sample the element with index `self.pos` as the transitions is invalid
@@ -461,10 +491,14 @@ class ReplayBuffer(BaseBuffer):
 
     def _get_samples(self, batch_inds: np.ndarray) -> ReplayBufferSamples:
         # Sample randomly the env idx
-        env_indices = np.random.randint(0, high=self.n_envs, size=(len(batch_inds),))
+        if self.gpu_storage:
+             env_indices = th.randint(0, high=self.n_envs, size=(len(batch_inds),), device=self.device)
+        else:
+             env_indices = np.random.randint(0, high=self.n_envs, size=(len(batch_inds),))
 
         if self.optimize_memory_usage:
-            next_obs = self.observations[(batch_inds + 1) % self.buffer_size, env_indices, :]
+            idx = (batch_inds + 1) % self.buffer_size
+            next_obs = self.observations[idx, env_indices, :]
         else:
             next_obs = self.next_observations[batch_inds, env_indices, :]
 
@@ -477,6 +511,10 @@ class ReplayBuffer(BaseBuffer):
             (self.dones[batch_inds, env_indices] * (1 - self.timeouts[batch_inds, env_indices])).reshape(-1, 1),
             self.rewards[batch_inds, env_indices].reshape(-1, 1),
         )
+
+        if self.gpu_storage:
+             return ReplayBufferSamples(*data)
+        
         return ReplayBufferSamples(*tuple(map(self.to_torch, data)))
 
     @staticmethod

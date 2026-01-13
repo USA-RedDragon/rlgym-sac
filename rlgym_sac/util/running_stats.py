@@ -28,6 +28,8 @@ class WelfordRunningStat(object):
         self.shape = shape
 
     def increment(self, samples, num):
+        if num == 0:
+            return
         if num > 1:
             for i in range(num):
                 self.update(samples[i])

@@ -1,11 +1,13 @@
 # docs and experiment results can be found at https://docs.cleanrl.dev/rl-algorithms/sac/#sac_continuous_actionpy
 import os
+os.environ["TORCHDYNAMO_INLINE_INBUILT_NN_MODULES"] = "1"
 from dataclasses import dataclass
 
 import gymnasium as gym
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 @dataclass
 class Args:
@@ -75,20 +77,51 @@ def make_env(env_id, seed, idx, capture_video, run_name):
 class SoftQNetwork(nn.Module):
     def __init__(self, env, layer_sizes=(256, 256)):
         super().__init__()
-        layers = []
-        input_dim = np.array(env.single_observation_space.shape).prod() + np.prod(env.single_action_space.shape)
-        
-        for size in layer_sizes:
-            layers.append(nn.Linear(input_dim, size))
-            layers.append(nn.ReLU())
-            input_dim = size
+        # Direct implementation for common case to help Compiler/Dynamo
+        if layer_sizes == (256, 256):
+            input_dim = np.array(env.single_observation_space.shape).prod() + np.prod(env.single_action_space.shape)
+            self.fc1 = nn.Linear(input_dim, 256)
+            self.fc2 = nn.Linear(256, 256)
+            self.fc3 = nn.Linear(256, 1)
+            self.net_arch = 2
+            self.use_seq = False
+        elif layer_sizes == (256, 256, 256):
+            input_dim = np.array(env.single_observation_space.shape).prod() + np.prod(env.single_action_space.shape)
+            self.fc1 = nn.Linear(input_dim, 256)
+            self.fc2 = nn.Linear(256, 256)
+            self.fc3 = nn.Linear(256, 256)
+            self.fc4 = nn.Linear(256, 1)
+            self.net_arch = 3
+            self.use_seq = False
+        else:
+            layers = []
+            input_dim = np.array(env.single_observation_space.shape).prod() + np.prod(env.single_action_space.shape)
             
-        layers.append(nn.Linear(input_dim, 1))
-        self.net = nn.Sequential(*layers)
+            for size in layer_sizes:
+                layers.append(nn.Linear(input_dim, size))
+                layers.append(nn.ReLU())
+                input_dim = size
+                
+            layers.append(nn.Linear(input_dim, 1))
+            self.net = nn.Sequential(*layers)
+            self.use_seq = True
 
     def forward(self, x, a):
         x = torch.cat([x, a], 1)
-        return self.net(x)
+        if not self.use_seq:
+            if self.net_arch == 2:
+                x = F.relu(self.fc1(x))
+                x = F.relu(self.fc2(x))
+                x = self.fc3(x)
+                return x
+            elif self.net_arch == 3:
+                x = F.relu(self.fc1(x))
+                x = F.relu(self.fc2(x))
+                x = F.relu(self.fc3(x))
+                x = self.fc4(x)
+                return x
+        else:
+            return self.net(x)
 
 
 LOG_STD_MAX = 2
@@ -99,18 +132,39 @@ class Actor(nn.Module):
     def __init__(self, env, layer_sizes=(256, 256)):
         super().__init__()
         
-        layers = []
-        input_dim = np.array(env.single_observation_space.shape).prod()
-        
-        for size in layer_sizes:
-            layers.append(nn.Linear(input_dim, size))
-            layers.append(nn.ReLU())
-            input_dim = size
+        # Direct implementation for common case to help Compiler/Dynamo
+        if layer_sizes == (256, 256):
+            input_dim = np.array(env.single_observation_space.shape).prod()
+            self.fc1 = nn.Linear(input_dim, 256)
+            self.fc2 = nn.Linear(256, 256)
+            self.fc_mean = nn.Linear(256, np.prod(env.single_action_space.shape))
+            self.fc_logstd = nn.Linear(256, np.prod(env.single_action_space.shape))
+            self.net_arch = 2
+            self.use_seq = False
+        elif layer_sizes == (256, 256, 256):
+            input_dim = np.array(env.single_observation_space.shape).prod()
+            self.fc1 = nn.Linear(input_dim, 256)
+            self.fc2 = nn.Linear(256, 256)
+            self.fc3 = nn.Linear(256, 256)
+            self.fc_mean = nn.Linear(256, np.prod(env.single_action_space.shape))
+            self.fc_logstd = nn.Linear(256, np.prod(env.single_action_space.shape))
+            self.net_arch = 3
+            self.use_seq = False
+        else:
+            layers = []
+            input_dim = np.array(env.single_observation_space.shape).prod()
             
-        self.net = nn.Sequential(*layers)
-        
-        self.fc_mean = nn.Linear(input_dim, np.prod(env.single_action_space.shape))
-        self.fc_logstd = nn.Linear(input_dim, np.prod(env.single_action_space.shape))
+            for size in layer_sizes:
+                layers.append(nn.Linear(input_dim, size))
+                layers.append(nn.ReLU())
+                input_dim = size
+                
+            self.net = nn.Sequential(*layers)
+            
+            self.fc_mean = nn.Linear(input_dim, np.prod(env.single_action_space.shape))
+            self.fc_logstd = nn.Linear(input_dim, np.prod(env.single_action_space.shape))
+            self.use_seq = True
+
         # action rescaling
         self.register_buffer(
             "action_scale",
@@ -128,9 +182,19 @@ class Actor(nn.Module):
         )
 
     def forward(self, x):
-        x = self.net(x)
+        if not self.use_seq:
+            if self.net_arch == 2:
+                x = F.relu(self.fc1(x))
+                x = F.relu(self.fc2(x))
+            elif self.net_arch == 3:
+                x = F.relu(self.fc1(x))
+                x = F.relu(self.fc2(x))
+                x = F.relu(self.fc3(x))
+        else:
+            x = self.net(x)
         mean = self.fc_mean(x)
         log_std = self.fc_logstd(x)
+
         log_std = torch.tanh(log_std)
         log_std = LOG_STD_MIN + 0.5 * (LOG_STD_MAX - LOG_STD_MIN) * (log_std + 1)  # From SpinUp / Denis Yarats
 
