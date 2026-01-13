@@ -24,7 +24,7 @@ setup(
 
     install_requires=[
         'gymnasium>=1.2.3',
-        'numpy>=1.21',
+        'numpy>=1.26.4',
         'rlviser-py>=0.6.13',
         'rocketsim>=2.1.1.post4',
         'torch>=1.13',
