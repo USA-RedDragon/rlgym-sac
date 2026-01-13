@@ -27,7 +27,7 @@ setup(
         'numpy>=1.21',
         'rlviser-py>=0.6.13',
         'rocketsim>=2.1.1.post4',
-        'torch>=1.13',
+        'torch>=2.9.1',
         'wandb>=0.15',
     ],
     python_requires='>=3.7',
