@@ -3,7 +3,7 @@ from abc import ABC
 import numpy as np
 
 try:
-    from rlgym_sim.utils.gamestates import GameState
+    from rlgym.rocket_league.api import GameState
 except ImportError:
     GameState = object
 

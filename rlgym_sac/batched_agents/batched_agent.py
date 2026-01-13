@@ -21,6 +21,7 @@ def batched_agent_process(proc_id, endpoint, shm_buffer, shm_offset, shm_size, s
     import numpy as np
 
     from rlgym_sac.batched_agents import comm_consts
+    from rlgym_sac.util.rlgym_v2_gym_wrapper import RLGymV2GymWrapper
 
     if render:
         try:
@@ -64,10 +65,14 @@ def batched_agent_process(proc_id, endpoint, shm_buffer, shm_offset, shm_size, s
             build_env_fn = data[1]
             metrics_encoding_function = data[2]
 
-            env = build_env_fn()
+            env = RLGymV2GymWrapper(build_env_fn())
 
     # Seed everything.
-    env.action_space.seed(seed)
+    import random
+    random.seed(seed)
+    np.random.seed(seed)
+    # env.seed(seed)
+    # env.action_space.seed(seed)
     reset_state = env.reset()
     if isinstance(reset_state, tuple):
         reset_state = reset_state[0]
@@ -135,13 +140,17 @@ def batched_agent_process(proc_id, endpoint, shm_buffer, shm_offset, shm_size, s
 
                 if n_agents == 1 and type(rew) is not list:
                     rew = [float(rew)]
+                
+                # Check for either done or truncated
+                is_done_or_truncated = done or truncated
 
-                if done or truncated:
+                if is_done_or_truncated:
                     reset_state = env.reset()
                     if isinstance(reset_state, tuple):
                         reset_state = reset_state[0]
                     obs = np.asarray(reset_state, dtype=np.float32)
                     n_agents = float(obs.shape[0]) if len(obs.shape) > 1 else 1
+
 
                     state_shape = [float(arg) for arg in obs.shape]
                     n_elements_in_state_shape = len(state_shape)
