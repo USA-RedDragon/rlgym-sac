@@ -363,7 +363,7 @@ class Learner(object):
 
         print(f"Saving checkpoint {cumulative_timesteps}...")
         existing_checkpoints = [
-            int(arg) for arg in os.listdir(self.checkpoints_save_folder)
+            int(arg) for arg in os.listdir(self.checkpoints_save_folder) if arg.isdigit()
         ]
         if len(existing_checkpoints) > self.n_checkpoints_to_keep:
             existing_checkpoints.sort()
@@ -372,7 +372,6 @@ class Learner(object):
                     os.path.join(self.checkpoints_save_folder, str(checkpoint_name))
                 )
 
-        os.makedirs(folder_path, exist_ok=True)
 
         self.sac_learner.save_to(folder_path)
 
@@ -425,7 +424,7 @@ class Learner(object):
                         continue
 
                     if full_path.startswith(base_save_folder):
-                        unix_start_idx = full_path.rfind('-') + 1
+                        unix_start_idx = filename.rfind('-') + 1
                         if unix_start_idx > 0:
                             unix_time_str = filename[unix_start_idx:]
                             if unix_time_str.isdigit():
