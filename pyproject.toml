@@ -25,7 +25,7 @@ classifiers = [
 urls = { repository = "https://github.com/USA-RedDragon/rlgym-sac" }
 dependencies = [
     "gymnasium>=1.2.3",
-    "numpy>=1.26.4",
+    "numpy>=2.4.1",
     "rlviser-py>=0.6.13",
     "rocketsim>=2.1.1.post4",
     "torch>=2.9.1",
